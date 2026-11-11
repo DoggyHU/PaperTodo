@@ -8,8 +8,9 @@ using PaperTodo.Plugin;
 namespace PaperTodo.Plugin.BulkImport;
 
 /// <summary>
-/// The import surface shared by the plugin's own paper body and the popup dialog. It owns the
-/// text box, the split options, the live preview and the actual <c>todos.append</c> call.
+/// The task editor shared by the plugin's own paper body and the popup window: the text box holds
+/// the paper's whole task list, one task per line, and 确定 writes the difference back through
+/// <c>todos.append</c> / <c>todos.update</c> / <c>todos.delete</c>.
 /// </summary>
 internal sealed class BulkImportPanel : UserControl
 {
@@ -23,31 +24,29 @@ internal sealed class BulkImportPanel : UserControl
     private readonly DispatcherTimer _previewDelay;
 
     private BulkPalette _palette;
-    private bool _lockedPaperTitleKnown;
-    private string _lockedPaperTitle = string.Empty;
+    private readonly List<EditorTodo> _baseline = [];
+    private string? _loadedPaperId;
+    private bool _deleteArmed;
+    private int _armedDeleteCount;
+    private bool _reloadArmed;
+    private bool _suppress;
+    private bool _busy;
+    private string _lockedPaperTitle;
 
     private readonly ComboBox _targetCombo = new();
     private readonly TextBlock _targetText = new();
     private readonly TextBlock _targetLabel = new();
     private readonly TextBox _input = new();
     private readonly TextBlock _inputHint = new();
-    private readonly RadioButton _lineMode = new();
-    private readonly RadioButton _paragraphMode = new();
     private readonly CheckBox _stripMarkers = new();
-    private readonly CheckBox _dedupeBatch = new();
-    private readonly CheckBox _skipExisting = new();
-    private readonly CheckBox _collapseWhitespace = new();
+    private readonly CheckBox _dedupeNew = new();
     private readonly TextBlock _status = new();
     private readonly TextBlock _statusDetail = new();
-    private readonly Chip _importChip;
-    private readonly Chip _undoChip;
+    private readonly Chip _applyChip;
+    private readonly Chip _reloadChip;
     private readonly Chip _cancelChip;
     private readonly Border _inputFrame;
     private readonly Grid _root = new();
-
-    private bool _suppressPreview;
-    private string? _lastImportPaperId;
-    private IReadOnlyList<string>? _lastImportTodoIds;
 
     public BulkImportPanel(
         IPaperTodoHostApi workspace,
@@ -62,14 +61,15 @@ internal sealed class BulkImportPanel : UserControl
         _workspace = workspace;
         _hostControls = hostControls;
         _palette = palette;
-        _lockedPaperId = SortableId(paperId);
+        _lockedPaperId = string.IsNullOrWhiteSpace(paperId) ? null : paperId;
         _lockedPaperTitle = paperTitle ?? string.Empty;
         _allowCancel = allowCancel;
         _cancelRequested = cancelRequested;
-        _importChip = new Chip("导入", palette, primary: true, onClick: Import);
-        _undoChip = new Chip("撤销本次导入", palette, primary: false, onClick: UndoLastImport);
-        _cancelChip = new Chip("取消", palette, primary: false, compact: true, onClick: () => _cancelRequested?.Invoke());
-        _undoChip.ChipEnabled = false;
+
+        _applyChip = new Chip("确定", palette, primary: true, onClick: ApplyNow);
+        _reloadChip = new Chip("重新载入", palette, primary: false, compact: true, onClick: ReloadClicked);
+        _cancelChip = new Chip("取消", palette, primary: false, compact: true,
+            onClick: () => _cancelRequested?.Invoke());
         _cancelChip.Visibility = allowCancel ? Visibility.Visible : Visibility.Collapsed;
         _inputFrame = new Border();
 
@@ -77,29 +77,41 @@ internal sealed class BulkImportPanel : UserControl
         _previewDelay.Tick += (_, _) =>
         {
             _previewDelay.Stop();
-            UpdatePreview();
+            RecomputePreview();
         };
 
         Content = BuildUi();
         ApplyPalette(palette);
 
-        _input.TextChanged += OnInputChanged;
-        _lineMode.Checked += OnOptionChanged;
-        _paragraphMode.Checked += OnOptionChanged;
-        foreach (var box in new[] { _stripMarkers, _dedupeBatch, _skipExisting, _collapseWhitespace })
+        _input.TextChanged += (_, _) =>
         {
-            box.Checked += OnOptionChanged;
-            box.Unchecked += OnOptionChanged;
+            _inputHint.Visibility = _input.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+            if (_suppress)
+            {
+                return;
+            }
+            ResetArmed();
+            _previewDelay.Stop();
+            _previewDelay.Start();
+        };
+
+        foreach (var box in new[] { _stripMarkers, _dedupeNew })
+        {
+            box.Checked += (_, _) => OnOptionsChanged();
+            box.Unchecked += (_, _) => OnOptionsChanged();
         }
 
         _targetCombo.SelectionChanged += (_, _) =>
         {
-            _previewDelay.Stop();
-            UpdatePreview();
+            if (_suppress)
+            {
+                return;
+            }
             if (_targetCombo.SelectedItem is PaperOption selected)
             {
                 BulkImportSettings.LastTargetPaperId = selected.Id;
                 TargetChanged?.Invoke(selected.Id);
+                LoadBaseline();
             }
         };
 
@@ -116,13 +128,43 @@ internal sealed class BulkImportPanel : UserControl
         }
     }
 
-    /// <summary>Raised when the picker's target paper changes or an import succeeds.</summary>
+    /// <summary>Raised when the picker's target paper changes or a save lands.</summary>
     public event Action<string>? TargetChanged;
 
-    /// <summary>True when the paste box still holds text (used by the dialog's Esc handling).</summary>
-    public bool HasInput => _input.Text.Length > 0;
+    /// <summary>True when the text box no longer matches the loaded task list.</summary>
+    public bool HasPendingChanges
+    {
+        get
+        {
+            if (_loadedPaperId == null)
+            {
+                return BulkImportText.SplitLines(_input.Text).Count > 0;
+            }
 
-    /// <summary>The todo paper this import will write into, or null when none is available.</summary>
+            var current = BulkImportText.SplitLines(_input.Text);
+            if (current.Count != _baseline.Count)
+            {
+                return true;
+            }
+
+            for (var index = 0; index < current.Count; index++)
+            {
+                if (!string.Equals(
+                        BulkImportText.Normalize(current[index]),
+                        BulkImportText.Normalize(_baseline[index].Text),
+                        StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>Number of tasks currently loaded (used by the diagnostics build).</summary>
+    internal int BaselineCount => _baseline.Count;
+
     public string? CurrentPaperId => _lockedPaperId ?? (_targetCombo.SelectedItem as PaperOption)?.Id;
 
     public string CurrentPaperTitle =>
@@ -130,25 +172,20 @@ internal sealed class BulkImportPanel : UserControl
             ? _lockedPaperTitle
             : (_targetCombo.SelectedItem as PaperOption)?.Title ?? string.Empty;
 
-    /// <summary>Seeds the checkboxes/radios from the host-managed plugin settings.</summary>
-    public void ApplyDefaults(BulkImportOptions options)
+    public void ApplyDefaults(BulkEditOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _suppressPreview = true;
+        _suppress = true;
         try
         {
-            _lineMode.IsChecked = options.Mode == BulkSplitMode.Lines;
-            _paragraphMode.IsChecked = options.Mode == BulkSplitMode.Paragraphs;
-            _stripMarkers.IsChecked = options.StripListMarkers;
-            _dedupeBatch.IsChecked = options.DedupeWithinBatch;
-            _skipExisting.IsChecked = options.SkipExisting;
-            _collapseWhitespace.IsChecked = options.CollapseWhitespace;
+            _stripMarkers.IsChecked = options.StripMarkersOnNewLines;
+            _dedupeNew.IsChecked = options.DedupeNewLines;
         }
         finally
         {
-            _suppressPreview = false;
+            _suppress = false;
         }
-        UpdatePreview();
+        RecomputePreview();
     }
 
     public void SetLockedPaperTitle(string title)
@@ -158,7 +195,6 @@ internal sealed class BulkImportPanel : UserControl
             return;
         }
         _lockedPaperTitle = title ?? string.Empty;
-        _lockedPaperTitleKnown = true;
         _targetText.Text = DescribeTarget();
     }
 
@@ -167,7 +203,6 @@ internal sealed class BulkImportPanel : UserControl
         _palette = palette;
         FontFamily = palette.Font;
         FontSize = palette.Scale(12.5);
-        _root.Background = Brushes.Transparent;
 
         _targetText.Foreground = palette.WeakBrush;
         _targetText.FontFamily = palette.Font;
@@ -187,15 +222,9 @@ internal sealed class BulkImportPanel : UserControl
         _input.FontSize = palette.Scale(13);
         _inputHint.Foreground = palette.WeakBrush;
         _inputHint.FontFamily = palette.Font;
-        _inputHint.FontSize = palette.Scale(13);
+        _inputHint.FontSize = palette.Scale(12.5);
 
-        foreach (var button in new Control[] { _lineMode, _paragraphMode })
-        {
-            button.Foreground = palette.TextBrush;
-            button.FontFamily = palette.Font;
-            button.FontSize = palette.Scale(12);
-        }
-        foreach (var box in new Control[] { _stripMarkers, _dedupeBatch, _skipExisting, _collapseWhitespace })
+        foreach (var box in new Control[] { _stripMarkers, _dedupeNew })
         {
             box.Foreground = palette.TextBrush;
             box.FontFamily = palette.Font;
@@ -211,12 +240,12 @@ internal sealed class BulkImportPanel : UserControl
         _targetCombo.FontFamily = palette.Font;
         _targetCombo.FontSize = palette.Scale(12);
 
-        _importChip.ApplyPalette(palette);
-        _undoChip.ApplyPalette(palette);
+        _applyChip.ApplyPalette(palette);
+        _reloadChip.ApplyPalette(palette);
         _cancelChip.ApplyPalette(palette);
 
         _targetText.Text = DescribeTarget();
-        UpdatePreview();
+        RecomputePreview();
     }
 
     public void FocusInput()
@@ -233,17 +262,108 @@ internal sealed class BulkImportPanel : UserControl
             }));
     }
 
+    /// <summary>Loads the paper's current tasks into the editor, discarding uncommitted edits.</summary>
+    public void LoadBaseline()
+    {
+        var paperId = CurrentPaperId;
+        _baseline.Clear();
+        _loadedPaperId = null;
+        ResetArmed();
+
+        if (paperId == null)
+        {
+            _suppress = true;
+            _input.Text = string.Empty;
+            _suppress = false;
+            _inputHint.Visibility = Visibility.Visible;
+            RecomputePreview();
+            return;
+        }
+
+        IReadOnlyList<EditorTodo> todos;
+        try
+        {
+            todos = ReadTodos(paperId);
+        }
+        catch (Exception ex)
+        {
+            ShowError($"读取任务失败：{ex.Message}");
+            return;
+        }
+
+        _baseline.AddRange(todos);
+        _loadedPaperId = paperId;
+
+        _suppress = true;
+        _input.Text = string.Join("\n", todos.Select(todo => todo.Text));
+        _suppress = false;
+        _inputHint.Visibility = _input.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        RecomputePreview();
+    }
+
     public void RefreshPapers()
     {
-        if (_lockedPaperId != null)
+        if (_lockedPaperId == null)
+        {
+            LoadPapers();
+        }
+    }
+
+    /// <summary>Wired by the window so Ctrl+Enter saves from anywhere in the dialog.</summary>
+    public void ApplyNow()
+    {
+        if (_busy)
         {
             return;
         }
-        LoadPapers();
-    }
 
-    /// <summary>Wired by the dialog so Ctrl+Enter imports from anywhere in the window.</summary>
-    public void ImportNow() => Import();
+        var paperId = CurrentPaperId;
+        if (paperId == null)
+        {
+            ShowError("没有可编辑的待办纸片。");
+            return;
+        }
+
+        if (_loadedPaperId != paperId)
+        {
+            LoadBaseline();
+        }
+
+        var plan = TodoEditPlan.Build(_baseline, _input.Text, ReadOptions());
+        if (!plan.HasChanges)
+        {
+            ShowTransientNotice("没有改动。");
+            return;
+        }
+
+        // Optimistic concurrency: the paper may have been edited elsewhere while the editor was open.
+        IReadOnlyList<EditorTodo> current;
+        try
+        {
+            current = ReadTodos(paperId);
+        }
+        catch (Exception ex)
+        {
+            ShowError($"读取任务失败：{ex.Message}");
+            return;
+        }
+        if (!SameAsBaseline(current))
+        {
+            ShowError("这张纸在编辑期间被改动过，请点「重新载入」再改。");
+            return;
+        }
+
+        if (plan.Deletes.Count > 0 &&
+            (!_deleteArmed || _armedDeleteCount != plan.Deletes.Count))
+        {
+            _deleteArmed = true;
+            _armedDeleteCount = plan.Deletes.Count;
+            RecomputePreview();
+            return;
+        }
+
+        Execute(paperId, plan);
+    }
 
     protected override void OnPreviewKeyDown(KeyEventArgs e)
     {
@@ -251,13 +371,20 @@ internal sealed class BulkImportPanel : UserControl
         if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
         {
             e.Handled = true;
-            Import();
+            ApplyNow();
         }
+    }
+
+    public void ShowTransientNotice(string message)
+    {
+        _status.Foreground = _palette.WeakBrush;
+        _status.Text = message;
+        _statusDetail.Text = string.Empty;
     }
 
     private UIElement BuildUi()
     {
-        _root.Margin = new Thickness(0);
+        _root.Background = Brushes.Transparent;
         for (var index = 0; index < 5; index++)
         {
             _root.RowDefinitions.Add(index switch
@@ -271,12 +398,11 @@ internal sealed class BulkImportPanel : UserControl
         var targetRow = new Grid { Margin = new Thickness(0, 0, 0, Gap) };
         targetRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         targetRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var targetLabel = _targetLabel;
-        targetLabel.Text = "导入到";
-        targetLabel.VerticalAlignment = VerticalAlignment.Center;
-        targetLabel.Margin = new Thickness(0, 0, 8, 0);
-        Grid.SetColumn(targetLabel, 0);
-        targetRow.Children.Add(targetLabel);
+        _targetLabel.Text = "目标";
+        _targetLabel.VerticalAlignment = VerticalAlignment.Center;
+        _targetLabel.Margin = new Thickness(0, 0, 8, 0);
+        Grid.SetColumn(_targetLabel, 0);
+        targetRow.Children.Add(_targetLabel);
 
         var targetHost = new Grid();
         Grid.SetColumn(targetHost, 1);
@@ -290,7 +416,7 @@ internal sealed class BulkImportPanel : UserControl
         Grid.SetRow(targetRow, 0);
         _root.Children.Add(targetRow);
 
-        // Row 1 — the paste box.
+        // Row 1 — the task list.
         _input.AcceptsReturn = true;
         _input.AcceptsTab = false;
         _input.TextWrapping = TextWrapping.NoWrap;
@@ -300,7 +426,7 @@ internal sealed class BulkImportPanel : UserControl
         _input.BorderThickness = new Thickness(0);
         _input.VerticalContentAlignment = VerticalAlignment.Top;
 
-        _inputHint.Text = "把整篇文档粘贴到这里（Ctrl+V）。每个换行会拆成一条任务。";
+        _inputHint.Text = "一行一条任务。当前纸上没有任何任务，直接写就行。";
         _inputHint.IsHitTestVisible = false;
         _inputHint.TextWrapping = TextWrapping.Wrap;
         _inputHint.Margin = new Thickness(12, 10, 12, 0);
@@ -308,44 +434,26 @@ internal sealed class BulkImportPanel : UserControl
 
         _inputFrame.CornerRadius = new CornerRadius(8);
         _inputFrame.BorderThickness = new Thickness(1);
-        _inputFrame.Child = new Grid
-        {
-            Children = { _input, _inputHint }
-        };
+        _inputFrame.Child = new Grid { Children = { _input, _inputHint } };
         _inputFrame.Margin = new Thickness(0, 0, 0, Gap);
         Grid.SetRow(_inputFrame, 1);
         _root.Children.Add(_inputFrame);
 
-        // Row 2 — options.
-        var optionPanel = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
-        _lineMode.Content = "每行一条";
-        _paragraphMode.Content = "每空行一段";
-        _lineMode.GroupName = "split";
-        _paragraphMode.GroupName = "split";
-        _lineMode.Margin = new Thickness(0, 0, 14, 0);
-        _paragraphMode.Margin = new Thickness(0, 0, 22, 0);
-        _stripMarkers.Content = "去掉行首序号";
-        _dedupeBatch.Content = "批内去重";
-        _skipExisting.Content = "跳过已存在";
-        _collapseWhitespace.Content = "合并空格";
-        foreach (var control in new FrameworkElement[]
-                 {
-                     _lineMode, _paragraphMode, _stripMarkers, _dedupeBatch, _skipExisting, _collapseWhitespace
-                 })
+        // Row 2 — options that only touch newly added lines.
+        var options = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
+        _stripMarkers.Content = "新行去掉行首序号";
+        _dedupeNew.Content = "新行去重";
+        foreach (var box in new FrameworkElement[] { _stripMarkers, _dedupeNew })
         {
-            control.Margin = new Thickness(0, 0, 14, 4);
-            control.VerticalAlignment = VerticalAlignment.Center;
+            box.Margin = new Thickness(0, 0, 16, 4);
+            box.VerticalAlignment = VerticalAlignment.Center;
         }
-        optionPanel.Children.Add(_lineMode);
-        optionPanel.Children.Add(_paragraphMode);
-        optionPanel.Children.Add(_stripMarkers);
-        optionPanel.Children.Add(_dedupeBatch);
-        optionPanel.Children.Add(_skipExisting);
-        optionPanel.Children.Add(_collapseWhitespace);
-        Grid.SetRow(optionPanel, 2);
-        _root.Children.Add(optionPanel);
+        options.Children.Add(_stripMarkers);
+        options.Children.Add(_dedupeNew);
+        Grid.SetRow(options, 2);
+        _root.Children.Add(options);
 
-        // Row 3 — live preview / result.
+        // Row 3 — live diff / result.
         var statusPanel = new StackPanel { Margin = new Thickness(0, 0, 0, Gap) };
         _status.TextWrapping = TextWrapping.Wrap;
         _statusDetail.TextWrapping = TextWrapping.Wrap;
@@ -359,13 +467,13 @@ internal sealed class BulkImportPanel : UserControl
         actions.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         actions.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         var left = new StackPanel { Orientation = Orientation.Horizontal };
-        left.Children.Add(_undoChip);
+        left.Children.Add(_reloadChip);
         Grid.SetColumn(left, 0);
         actions.Children.Add(left);
         var right = new StackPanel { Orientation = Orientation.Horizontal };
         _cancelChip.Margin = new Thickness(0, 0, 8, 0);
         right.Children.Add(_cancelChip);
-        right.Children.Add(_importChip);
+        right.Children.Add(_applyChip);
         Grid.SetColumn(right, 1);
         actions.Children.Add(right);
         Grid.SetRow(actions, 4);
@@ -389,10 +497,13 @@ internal sealed class BulkImportPanel : UserControl
 
         var options = papers
             .OrderBy(paper => paper.Title, StringComparer.CurrentCulture)
-            .Select(paper => new PaperOption(paper.Id, string.IsNullOrWhiteSpace(paper.Title) ? "未命名待办" : paper.Title))
+            .Select(paper => new PaperOption(
+                paper.Id,
+                string.IsNullOrWhiteSpace(paper.Title) ? "未命名待办" : paper.Title))
             .ToList();
 
         var previous = (_targetCombo.SelectedItem as PaperOption)?.Id;
+        _suppress = true;
         _targetCombo.ItemsSource = options;
         _targetCombo.DisplayMemberPath = nameof(PaperOption.Title);
         _hostControls?.ApplySelectStyle(_targetCombo, FontSize);
@@ -400,216 +511,324 @@ internal sealed class BulkImportPanel : UserControl
             options.FirstOrDefault(option => option.Id == previous)
             ?? options.FirstOrDefault(option => option.Id == BulkImportSettings.LastTargetPaperId)
             ?? options.FirstOrDefault();
-
         _targetCombo.Visibility = options.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         _targetText.Visibility = Visibility.Collapsed;
+        _suppress = false;
 
         if (options.Count == 0)
         {
             _targetText.Visibility = Visibility.Visible;
             _targetText.Text = "还没有待办纸片，请先新建一张待办纸。";
+            _baseline.Clear();
+            _loadedPaperId = null;
+            ShowError("没有可编辑的待办纸片。");
+            return;
         }
 
-        UpdatePreview();
+        LoadBaseline();
     }
 
-    private void OnInputChanged(object? sender, TextChangedEventArgs e)
+    private void OnOptionsChanged()
     {
-        _inputHint.Visibility = _input.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
-        if (_suppressPreview)
+        if (_suppress)
         {
             return;
         }
+        ResetArmed();
         _previewDelay.Stop();
         _previewDelay.Start();
     }
 
-    private void OnOptionChanged(object? sender, RoutedEventArgs e)
+    private BulkEditOptions ReadOptions() => new()
     {
-        if (_suppressPreview)
-        {
-            return;
-        }
-        _previewDelay.Stop();
-        _previewDelay.Start();
-    }
-
-    private BulkImportOptions ReadOptions() => new()
-    {
-        Mode = _paragraphMode.IsChecked == true ? BulkSplitMode.Paragraphs : BulkSplitMode.Lines,
-        StripListMarkers = _stripMarkers.IsChecked == true,
-        DedupeWithinBatch = _dedupeBatch.IsChecked == true,
-        SkipExisting = _skipExisting.IsChecked == true,
-        CollapseWhitespace = _collapseWhitespace.IsChecked == true
+        StripMarkersOnNewLines = _stripMarkers.IsChecked == true,
+        DedupeNewLines = _dedupeNew.IsChecked == true
     };
 
-    private IReadOnlyList<string>? ReadExistingTexts(string paperId)
+    private IReadOnlyList<EditorTodo> ReadTodos(string paperId) =>
+        _workspace
+            .ListTodos(paperId, includeBlank: false)
+            .Select(todo => new EditorTodo(todo.Id, todo.Text, todo.Done))
+            .ToList();
+
+    private bool SameAsBaseline(IReadOnlyList<EditorTodo> current)
     {
-        try
+        if (current.Count != _baseline.Count)
         {
-            return _workspace
-                .ListTodos(paperId, includeBlank: true)
-                .Select(todo => todo.Text)
-                .ToList();
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private void UpdatePreview()
-    {
-        var paperId = CurrentPaperId;
-        _importChip.ChipEnabled = paperId != null;
-
-        if (paperId == null)
-        {
-            _status.Foreground = _palette.DangerBrush;
-            _status.Text = "没有可导入的待办纸片。";
-            _statusDetail.Text = "先在桌面上新建一张待办纸，再回到这里导入。";
-            return;
+            return false;
         }
 
-        if (_input.Text.Length == 0)
+        for (var index = 0; index < current.Count; index++)
         {
-            _status.Foreground = _palette.WeakBrush;
-            _status.Text = "等待粘贴内容。";
-            _statusDetail.Text = string.Empty;
-            return;
-        }
-
-        var options = ReadOptions();
-        var existing = options.SkipExisting ? ReadExistingTexts(paperId) : null;
-        var result = BulkImportParser.Parse(_input.Text, options, existing);
-
-        if (result.Items.Count == 0)
-        {
-            _status.Foreground = _palette.DangerBrush;
-            _status.Text = "没有解析出可导入的任务。";
-            _statusDetail.Text = Describe(result);
-            return;
-        }
-
-        _status.Foreground = _palette.TextBrush;
-        _status.Text = $"将导入 {result.Items.Count} 条任务";
-        _statusDetail.Text = Describe(result);
-    }
-
-    private string Describe(BulkParseResult result)
-    {
-        var parts = new List<string>();
-        if (result.BlankLines > 0)
-        {
-            parts.Add($"跳过空行 {result.BlankLines}");
-        }
-        if (result.Duplicates > 0)
-        {
-            parts.Add($"批内重复 {result.Duplicates}");
-        }
-        if (result.Existing > 0)
-        {
-            parts.Add($"已存在 {result.Existing}");
-        }
-        if (result.Truncated > 0)
-        {
-            parts.Add($"{result.Truncated} 行超长已截断到 {BulkImportParser.MaxItemLength} 字");
-        }
-        if (result.Overflow > 0)
-        {
-            parts.Add($"超出 {BulkImportParser.MaxItems} 条上限，还有 {result.Overflow} 条未导入");
-        }
-        return string.Join(" · ", parts);
-    }
-
-    private void Import()
-    {
-        var paperId = CurrentPaperId;
-        if (paperId == null)
-        {
-            ShowError("没有可导入的待办纸片。");
-            return;
-        }
-
-        _previewDelay.Stop();
-        var options = ReadOptions();
-        var existing = options.SkipExisting ? ReadExistingTexts(paperId) : null;
-        var result = BulkImportParser.Parse(_input.Text, options, existing);
-        if (result.Items.Count == 0)
-        {
-            ShowError("没有解析出可导入的任务。");
-            return;
-        }
-
-        try
-        {
-            var appended = _workspace.AppendTodos(new AppendTodosRequest
+            if (!string.Equals(current[index].Id, _baseline[index].Id, StringComparison.Ordinal) ||
+                !string.Equals(
+                    BulkImportText.Normalize(current[index].Text),
+                    BulkImportText.Normalize(_baseline[index].Text),
+                    StringComparison.Ordinal))
             {
-                PaperId = paperId,
-                Todos = result.Items
-                    .Select(text => new TodoCreateItem { Text = text })
-                    .ToList()
-            });
-
-            _lastImportPaperId = appended.PaperId;
-            _lastImportTodoIds = appended.TodoIds;
-            _undoChip.ChipEnabled = appended.TodoIds.Count > 0;
-
-            _suppressPreview = true;
-            _input.Clear();
-            _suppressPreview = false;
-            _inputHint.Visibility = Visibility.Visible;
-
-            _status.Foreground = _palette.TextBrush;
-            _status.Text = $"已导入 {appended.TodoIds.Count} 条任务";
-            _statusDetail.Text = Describe(result);
-            BulkImportSettings.LastTargetPaperId = paperId;
-            TargetChanged?.Invoke(paperId);
+                return false;
+            }
         }
-        catch (PaperTodoPluginException ex)
+
+        return true;
+    }
+
+    private void RecomputePreview()
+    {
+        var paperId = CurrentPaperId;
+        _applyChip.ChipEnabled = paperId != null && !_busy;
+        _reloadChip.ChipEnabled = paperId != null && !_busy;
+
+        if (paperId == null)
         {
-            ShowError($"导入失败（{ex.Code}）：{ex.Message}");
+            _status.Foreground = _palette.DangerBrush;
+            _status.Text = "没有可编辑的待办纸片。";
+            _statusDetail.Text = "先在桌面上新建一张待办纸，再回到这里编辑。";
+            return;
         }
-        catch (Exception ex)
+
+        var plan = TodoEditPlan.Build(_baseline, _input.Text, ReadOptions());
+        if (!plan.HasChanges)
         {
-            ShowError($"导入失败：{ex.Message}");
+            var doneCount = _baseline.Count(todo => todo.Done);
+            _status.Foreground = _palette.WeakBrush;
+            _status.Text = $"共 {plan.Lines.Count} 条任务，与当前一致。";
+            _statusDetail.Text = doneCount > 0 ? $"其中已完成 {doneCount} 条。" : string.Empty;
+            _applyChip.SetText("确定");
+            _applyChip.ChipEnabled = false;
+            return;
+        }
+
+        var parts = new List<string>();
+        parts.Add($"共 {plan.Lines.Count} 条");
+        if (plan.Adds.Count > 0)
+        {
+            parts.Add($"新增 {plan.Adds.Count}");
+        }
+        if (plan.Renames.Count > 0)
+        {
+            parts.Add($"改名 {plan.Renames.Count}");
+        }
+        if (plan.Deletes.Count > 0)
+        {
+            parts.Add($"删除 {plan.Deletes.Count}");
+        }
+        if (plan.Unchanged > 0)
+        {
+            parts.Add($"不变 {plan.Unchanged}");
+        }
+        if (plan.Rearranged &&
+            plan.Adds.Count == 0 &&
+            plan.Renames.Count == 0 &&
+            plan.Deletes.Count == 0)
+        {
+            parts.Add("调整顺序");
+        }
+
+        var hasDelete = plan.Deletes.Count > 0;
+        _status.Foreground = hasDelete ? _palette.DangerBrush : _palette.TextBrush;
+        _status.Text = string.Join(" · ", parts);
+
+        if (hasDelete)
+        {
+            _statusDetail.Text = _deleteArmed
+                ? $"确认要删除 {plan.Deletes.Count} 条任务？删除会同时移除完成状态、提醒和关联，且无法撤销。"
+                : $"删除的 {plan.Deletes.Count} 条任务会同时移除完成状态、提醒和关联，且无法撤销。";
+        }
+        else
+        {
+            _statusDetail.Text = plan.Warnings.Count > 0 ? string.Join(" · ", plan.Warnings) : string.Empty;
+        }
+
+        _applyChip.SetText(
+            hasDelete && _deleteArmed && _armedDeleteCount == plan.Deletes.Count
+                ? $"确认删除 {plan.Deletes.Count} 条"
+                : "确定");
+        _applyChip.ChipEnabled = true;
+    }
+
+    private void ResetArmed()
+    {
+        _deleteArmed = false;
+        _armedDeleteCount = 0;
+        _reloadArmed = false;
+    }
+
+    private void ReloadClicked()
+    {
+        if (HasPendingChanges && !_reloadArmed)
+        {
+            _reloadArmed = true;
+            ShowTransientNotice("再点一次「重新载入」会丢弃当前修改。");
+            return;
+        }
+
+        ResetArmed();
+        LoadBaseline();
+        ShowTransientNotice("已按纸上的最新内容重新载入。");
+    }
+
+    private void Execute(string paperId, TodoEditPlan plan)
+    {
+        _busy = true;
+        _applyChip.ChipEnabled = false;
+        var failures = new List<string>();
+        var deleted = 0;
+        var renamed = 0;
+        var addedIds = new List<string>();
+
+        try
+        {
+            foreach (var todoId in plan.Deletes)
+            {
+                try
+                {
+                    _workspace.DeleteTodo(new DeleteTodoRequest { PaperId = paperId, TodoId = todoId });
+                    deleted++;
+                }
+                catch (Exception ex)
+                {
+                    failures.Add($"删除失败：{Describe(ex)}");
+                }
+            }
+
+            foreach (var (todoId, text) in plan.Renames)
+            {
+                try
+                {
+                    _workspace.UpdateTodo(new UpdateTodoRequest
+                    {
+                        PaperId = paperId,
+                        TodoId = todoId,
+                        Text = text
+                    });
+                    renamed++;
+                }
+                catch (Exception ex)
+                {
+                    failures.Add($"改名失败：{Describe(ex)}");
+                }
+            }
+
+            if (plan.Adds.Count > 0)
+            {
+                foreach (var chunk in plan.Adds.Chunk(BulkImportLimits.MaxAddsPerBatch))
+                {
+                    try
+                    {
+                        var appended = _workspace.AppendTodos(new AppendTodosRequest
+                        {
+                            PaperId = paperId,
+                            Todos = chunk
+                                .Select(text => new TodoCreateItem { Text = text })
+                                .ToList()
+                        });
+                        addedIds.AddRange(appended.TodoIds);
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add($"新增失败：{Describe(ex)}");
+                    }
+                }
+            }
+
+            if (failures.Count == 0 && addedIds.Count == plan.Adds.Count)
+            {
+                var finalIds = new List<string>(plan.Lines.Count);
+                var nextNew = 0;
+                foreach (var line in plan.Lines)
+                {
+                    finalIds.Add(line.Id ?? addedIds[nextNew++]);
+                }
+                ReorderIfNeeded(paperId, finalIds, failures);
+            }
+
+            LoadBaseline();
+
+            _status.Foreground = failures.Count > 0 ? _palette.DangerBrush : _palette.TextBrush;
+            var summary = new List<string>();
+            if (deleted > 0)
+            {
+                summary.Add($"删除 {deleted}");
+            }
+            if (renamed > 0)
+            {
+                summary.Add($"改名 {renamed}");
+            }
+            if (addedIds.Count > 0)
+            {
+                summary.Add($"新增 {addedIds.Count}");
+            }
+            _status.Text = failures.Count > 0
+                ? $"部分完成：{string.Join(" · ", summary)}；{failures.Count} 项失败"
+                : $"已保存：{string.Join(" · ", summary)}";
+            _statusDetail.Text = failures.Count > 0 ? string.Join("；", failures.Take(3)) : string.Empty;
+        }
+        finally
+        {
+            _busy = false;
+            RecomputePreview();
         }
     }
 
-    private void UndoLastImport()
+    /// <summary>Makes the paper's managed tasks appear in the planned order using todos.update order.</summary>
+    private void ReorderIfNeeded(string paperId, IReadOnlyList<string> finalIds, List<string> failures)
     {
-        if (_lastImportPaperId == null || _lastImportTodoIds == null || _lastImportTodoIds.Count == 0)
+        if (finalIds.Count < 2)
         {
             return;
         }
 
-        var removed = 0;
-        var failed = 0;
-        foreach (var todoId in _lastImportTodoIds)
+        var order = _workspace
+            .ListTodos(paperId, includeBlank: true)
+            .OrderBy(todo => todo.Order)
+            .Select(todo => todo.Id)
+            .ToList();
+        var managed = new HashSet<string>(finalIds, StringComparer.Ordinal);
+        var currentSequence = order.Where(managed.Contains).ToList();
+        if (currentSequence.SequenceEqual(finalIds, StringComparer.Ordinal))
         {
+            return;
+        }
+
+        var start = order.IndexOf(finalIds[0]);
+        if (start < 0)
+        {
+            return;
+        }
+
+        for (var index = 0; index < finalIds.Count; index++)
+        {
+            var position = order.IndexOf(finalIds[index]);
+            var target = start + index;
+            if (position < 0 || position == target)
+            {
+                continue;
+            }
+
             try
             {
-                _workspace.DeleteTodo(new DeleteTodoRequest
+                _workspace.UpdateTodo(new UpdateTodoRequest
                 {
-                    PaperId = _lastImportPaperId,
-                    TodoId = todoId
+                    PaperId = paperId,
+                    TodoId = finalIds[index],
+                    Order = target
                 });
-                removed++;
+                order.RemoveAt(position);
+                order.Insert(Math.Min(target, order.Count), finalIds[index]);
             }
-            catch
+            catch (Exception ex)
             {
-                failed++;
+                failures.Add($"排序失败：{Describe(ex)}");
+                return;
             }
         }
-
-        _lastImportTodoIds = null;
-        _undoChip.ChipEnabled = false;
-        _status.Foreground = failed > 0 ? _palette.DangerBrush : _palette.TextBrush;
-        _status.Text = failed > 0
-            ? $"已删除 {removed} 条，{failed} 条没删掉（可能已被改动或删除）"
-            : $"已撤销本次导入，删除 {removed} 条任务";
-        _statusDetail.Text = string.Empty;
     }
+
+    private static string Describe(Exception ex) =>
+        ex is PaperTodoPluginException pluginException
+            ? $"{pluginException.Code} {pluginException.Message}"
+            : ex.Message;
 
     private void ShowError(string message)
     {
@@ -618,35 +837,18 @@ internal sealed class BulkImportPanel : UserControl
         _statusDetail.Text = string.Empty;
     }
 
-    /// <summary>Non-failing inline notice used by the dialog (for example the Esc-to-discard prompt).</summary>
-    public void ShowTransientNotice(string message)
-    {
-        _status.Foreground = _palette.WeakBrush;
-        _status.Text = message;
-        _statusDetail.Text = string.Empty;
-    }
-
-    private string DescribeTarget()
-    {
-        if (_lockedPaperId == null)
-        {
-            return string.Empty;
-        }
-        return _lockedPaperTitle.Length > 0
-            ? _lockedPaperTitle
-            : _lockedPaperTitleKnown ? "未命名待办" : "…";
-    }
-
-    private static string? SortableId(string? value) =>
-        string.IsNullOrWhiteSpace(value) ? null : value;
+    private string DescribeTarget() =>
+        _lockedPaperId == null
+            ? string.Empty
+            : _lockedPaperTitle.Length > 0 ? _lockedPaperTitle : "未命名待办";
 
     private sealed record PaperOption(string Id, string Title)
     {
         public override string ToString() => Title;
     }
 
-    /// <summary>Border-based button: host dialogs are not available inside a native plugin, and the
-    /// stock WPF Button chrome would not follow the paper palette.</summary>
+    /// <summary>Border-based button: a native plugin cannot host the app's own dialog chrome, and the
+    /// stock WPF Button look would not follow the paper palette.</summary>
     private sealed class Chip : Border
     {
         private readonly bool _primary;
@@ -704,6 +906,8 @@ internal sealed class BulkImportPanel : UserControl
             }
         }
 
+        public void SetText(string text) => _label.Text = text;
+
         public void ApplyPalette(BulkPalette palette)
         {
             _palette = palette;
@@ -732,9 +936,9 @@ internal sealed class BulkImportPanel : UserControl
         }
 
         private static Color Lighten(Color color, double amount) => Color.FromRgb(
-            (byte)Math.Min(255, color.R + (255 - color.R) * amount),
-            (byte)Math.Min(255, color.G + (255 - color.G) * amount),
-            (byte)Math.Min(255, color.B + (255 - color.B) * amount));
+            (byte)Math.Min(255, color.R + ((255 - color.R) * amount)),
+            (byte)Math.Min(255, color.G + ((255 - color.G) * amount)),
+            (byte)Math.Min(255, color.B + ((255 - color.B) * amount)));
 
         private static Color Blend(Color from, Color to, double amount) => Color.FromRgb(
             (byte)Math.Round(from.R + ((to.R - from.R) * amount)),

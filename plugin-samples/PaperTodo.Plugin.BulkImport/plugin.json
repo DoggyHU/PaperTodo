@@ -1,9 +1,9 @@
 {
   "kind": "native",
   "id": "com.doggyhu.bulk-import",
-  "name": "批量导入",
-  "description": "把整篇文档粘贴进来，按换行拆成待办任务，一次批量导入。",
-  "version": "1.0.0",
+  "name": "批量编辑",
+  "description": "把整张待办纸的任务当成一段文本编辑：一行一条，改完整体写回（新增 / 改名 / 删除 / 调序）。",
+  "version": "1.1.0",
   "apiVersion": "2.0",
   "stateVersion": 1,
   "entry": "PaperTodo.Plugin.BulkImport.dll",
@@ -14,19 +14,20 @@
     "papers.read",
     "todos.read",
     "todos.append",
+    "todos.update",
     "todos.delete"
   ],
   "startupPaper": {
     "enabledSetting": "autoStart",
     "instanceKey": "main",
     "presentation": "capsule",
-    "title": "批量导入"
+    "title": "批量编辑"
   },
   "settings": [
     {
       "id": "autoStart",
       "type": "boolean",
-      "name": "显示「批量导入」纸片",
+      "name": "显示「批量编辑」纸片",
       "description": "插件顶栏按钮需要至少一张本插件的纸片才能常驻；关闭后需要手动保留一张插件纸片。",
       "default": true,
       "quick": true
@@ -34,43 +35,18 @@
     {
       "id": "stripMarkers",
       "type": "boolean",
-      "name": "去掉行首序号 / 列表符号",
-      "description": "去掉 1. / 1、/ - / * / • / □ / [ ] / # 之类的行首标记。",
+      "name": "新行去掉行首序号 / 列表符号",
+      "description": "只影响新增的行：去掉 1. / 1、/ - / * / • / □ / [ ] / # 这类行首标记。已有任务不会被改写。",
       "default": true,
       "quick": true
     },
     {
       "id": "dedupeBatch",
       "type": "boolean",
-      "name": "批内去重",
-      "description": "同一次粘贴里完全相同的行只导入一条。",
+      "name": "新行去重",
+      "description": "只影响新增的行：与已有任务或本次新增内容重复的行自动跳过。",
       "default": true,
       "quick": true
-    },
-    {
-      "id": "splitMode",
-      "type": "select",
-      "name": "默认拆分方式",
-      "description": "每行一条适合清单；每空行一段适合从 PDF / Word 复制的段落正文。",
-      "default": "line",
-      "options": [
-        { "value": "line", "name": "每行一条" },
-        { "value": "paragraph", "name": "每空行一段" }
-      ]
-    },
-    {
-      "id": "skipExisting",
-      "type": "boolean",
-      "name": "跳过目标纸上已存在的任务",
-      "description": "按文本完全相同比较（忽略首尾空白与大小写）。",
-      "default": false
-    },
-    {
-      "id": "collapseWhitespace",
-      "type": "boolean",
-      "name": "合并连续空格",
-      "description": "把行内连续的空格 / 制表符合成一个半角空格。",
-      "default": false
     }
   ]
 }

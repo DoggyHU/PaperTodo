@@ -29,7 +29,7 @@ internal sealed class BulkImportDialog : Window
         BulkPalette palette,
         string? paperId,
         string paperTitle,
-        BulkImportOptions defaults)
+        BulkEditOptions defaults)
     {
         ArgumentNullException.ThrowIfNull(workspace);
         ArgumentNullException.ThrowIfNull(palette);
@@ -45,6 +45,7 @@ internal sealed class BulkImportDialog : Window
             allowCancel: true,
             cancelRequested: Close);
         _panel.ApplyDefaults(defaults);
+        _panel.LoadBaseline();
 
         WindowStyle = WindowStyle.None;
         AllowsTransparency = true;
@@ -59,7 +60,7 @@ internal sealed class BulkImportDialog : Window
         MinHeight = 400;
         UseLayoutRounding = true;
         SnapsToDevicePixels = true;
-        Title = "批量导入";
+        Title = "编辑任务";
 
         Content = BuildContent();
     }
@@ -75,10 +76,10 @@ internal sealed class BulkImportDialog : Window
         if (e.Key == Key.Escape)
         {
             e.Handled = true;
-            if (_panel.HasInput && !_escapeArmed)
+            if (_panel.HasPendingChanges && !_escapeArmed)
             {
                 _escapeArmed = true;
-                _panel.ShowTransientNotice("再按一次 Esc 关闭窗口（当前粘贴的内容会丢弃）");
+                _panel.ShowTransientNotice("再按一次 Esc 关闭窗口（当前修改会丢弃）");
                 return;
             }
             Close();
@@ -90,7 +91,7 @@ internal sealed class BulkImportDialog : Window
         {
             e.Handled = true;
             _escapeArmed = false;
-            _panel.ImportNow();
+            _panel.ApplyNow();
         }
     }
 
@@ -138,7 +139,7 @@ internal sealed class BulkImportDialog : Window
         var caption = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         caption.Children.Add(new TextBlock
         {
-            Text = "批量导入",
+            Text = "编辑任务",
             Foreground = _palette.TextBrush,
             FontFamily = _palette.Font,
             FontSize = _palette.Scale(13.5),
@@ -147,7 +148,7 @@ internal sealed class BulkImportDialog : Window
         });
         caption.Children.Add(new TextBlock
         {
-            Text = "  Ctrl+Enter 导入 · Esc 关闭",
+            Text = "  Ctrl+Enter 保存 · Esc 关闭",
             Foreground = _palette.WeakBrush,
             FontFamily = _palette.Font,
             FontSize = _palette.Scale(11),
@@ -251,3 +252,4 @@ internal sealed class BulkImportDialog : Window
         return grip;
     }
 }
+

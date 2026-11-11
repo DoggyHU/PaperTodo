@@ -4,17 +4,16 @@ namespace PaperTodo.Plugin.BulkImport;
 
 /// <summary>
 /// Reads the host-managed plugin settings and the plugin's own per-paper state. Protocol 2.0 gives
-/// app runtimes a read-only settings view, so the dialog only uses these values as seeds for its
-/// checkboxes.
+/// app runtimes a read-only settings view, so the editor only uses these values as seeds.
 /// </summary>
 internal static class BulkImportSettings
 {
-    /// <summary>Last todo paper the user imported into; used when the button is clicked on a non-todo paper.</summary>
+    /// <summary>Last todo paper the user edited; used when the button is clicked on a non-todo paper.</summary>
     public static string? LastTargetPaperId { get; set; }
 
-    public static BulkImportOptions Parse(string? settingsJson)
+    public static BulkEditOptions Parse(string? settingsJson)
     {
-        var options = new BulkImportOptions();
+        var options = new BulkEditOptions();
         if (string.IsNullOrWhiteSpace(settingsJson))
         {
             return options;
@@ -29,25 +28,12 @@ internal static class BulkImportSettings
                 return options;
             }
 
-            if (root.TryGetProperty("splitMode", out var mode) &&
-                mode.ValueKind == JsonValueKind.String)
-            {
-                options.Mode = string.Equals(
-                    mode.GetString(),
-                    "paragraph",
-                    StringComparison.OrdinalIgnoreCase)
-                    ? BulkSplitMode.Paragraphs
-                    : BulkSplitMode.Lines;
-            }
-
-            options.StripListMarkers = ReadBoolean(root, "stripMarkers", options.StripListMarkers);
-            options.DedupeWithinBatch = ReadBoolean(root, "dedupeBatch", options.DedupeWithinBatch);
-            options.SkipExisting = ReadBoolean(root, "skipExisting", options.SkipExisting);
-            options.CollapseWhitespace = ReadBoolean(root, "collapseWhitespace", options.CollapseWhitespace);
+            options.StripMarkersOnNewLines = ReadBoolean(root, "stripMarkers", options.StripMarkersOnNewLines);
+            options.DedupeNewLines = ReadBoolean(root, "dedupeBatch", options.DedupeNewLines);
         }
         catch (JsonException)
         {
-            // A malformed settings blob must never stop the import surface from opening.
+            // A malformed settings blob must never stop the editor from opening.
         }
 
         return options;

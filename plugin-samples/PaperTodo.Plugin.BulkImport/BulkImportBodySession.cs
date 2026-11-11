@@ -44,19 +44,19 @@ internal sealed class BulkImportBodySession : IPaperBodySession
             Child = _panel
         };
 
-        context.Paper.SetTitle("批量导入");
-        context.Paper.SetHeaderText("批量导入");
+        context.Paper.SetTitle("编辑任务");
+        context.Paper.SetHeaderText("编辑任务");
         context.Paper.SetCapsulePresentation(new PaperCapsulePresentation
         {
             PreferredWidth = PaperCapsulePresentation.AutomaticWidth,
-            PlainText = "批量导入",
-            ToolTip = "批量导入：粘贴整篇文档，按换行拆成任务",
+            PlainText = "编辑任务",
+            ToolTip = "编辑任务：一行一条，改完整体写回",
             Components =
             [
                 new PaperCapsuleComponent
                 {
                     Kind = PaperCapsuleComponentKind.Text,
-                    Text = "批量导入",
+                    Text = "编辑任务",
                     Fill = true
                 }
             ]
@@ -91,3 +91,4 @@ internal sealed class BulkImportBodySession : IPaperBodySession
         }
     }
 }
+

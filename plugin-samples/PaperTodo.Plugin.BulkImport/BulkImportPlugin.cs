@@ -3,19 +3,19 @@ using PaperTodo.Plugin;
 namespace PaperTodo.Plugin.BulkImport;
 
 /// <summary>
-/// Entry point of the 「批量导入」 plugin. This is the only public <see cref="IPaperBodyPlugin"/>
+/// Entry point of the 「批量编辑」 plugin. This is the only public <see cref="IPaperBodyPlugin"/>
 /// implementation in the assembly, which is what the host's native plugin loader requires.
 /// </summary>
 public sealed class BulkImportPlugin : IPaperBodyPlugin, IPaperAppRuntimeProvider
 {
     public string Id => "com.doggyhu.bulk-import";
 
-    public string DisplayName => "批量导入";
+    public string DisplayName => "批量编辑";
 
     public string Description =>
-        "把整篇文档粘贴进来，按换行拆成待办任务，一次批量导入到当前待办纸。";
+        "把整张待办纸的任务当成一段文本编辑：一行一条，改完整体写回（新增 / 改名 / 删除 / 调序）。";
 
-    public Version Version => new(1, 0, 0);
+    public Version Version => new(1, 1, 0);
 
     public string ApiVersion => "2.0";
 
@@ -29,3 +29,5 @@ public sealed class BulkImportPlugin : IPaperBodyPlugin, IPaperAppRuntimeProvide
 
     public IPaperAppRuntime CreateAppRuntime(PaperAppRuntimeContext context) => new BulkImportRuntime(context);
 }
+
+

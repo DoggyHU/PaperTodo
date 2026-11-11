@@ -34,7 +34,7 @@ internal sealed class BulkImportRuntime : IPaperAppRuntime
                     IconPath,
                     PaperTopBarSvgRenderMode.Stroke,
                     1.25),
-                ToolTip = "批量导入任务（粘贴整篇文档，按换行拆条）",
+                ToolTip = "编辑任务列表（一行一条，改完整体写回）",
                 Priority = 180
             }
         ]);
@@ -173,3 +173,4 @@ internal sealed class BulkImportRuntime : IPaperAppRuntime
         }
     }
 }
+
