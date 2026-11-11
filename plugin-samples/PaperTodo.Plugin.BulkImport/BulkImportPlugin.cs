@@ -15,7 +15,7 @@ public sealed class BulkImportPlugin : IPaperBodyPlugin, IPaperAppRuntimeProvide
     public string Description =>
         "把整张待办纸的任务当成一段文本编辑：一行一条，改完整体写回（新增 / 改名 / 删除 / 调序）。";
 
-    public Version Version => new(1, 1, 0);
+    public Version Version => new(1, 1, 1);
 
     public string ApiVersion => "2.0";
 
@@ -29,5 +29,6 @@ public sealed class BulkImportPlugin : IPaperBodyPlugin, IPaperAppRuntimeProvide
 
     public IPaperAppRuntime CreateAppRuntime(PaperAppRuntimeContext context) => new BulkImportRuntime(context);
 }
+
 
 

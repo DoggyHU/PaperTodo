@@ -21,6 +21,7 @@ internal sealed class BulkImportPanel : UserControl
     private readonly string? _lockedPaperId;
     private readonly bool _allowCancel;
     private readonly Action? _cancelRequested;
+    private readonly Action? _savedRequested;
     private readonly DispatcherTimer _previewDelay;
 
     private BulkPalette _palette;
@@ -55,10 +56,12 @@ internal sealed class BulkImportPanel : UserControl
         string? paperId,
         string paperTitle,
         bool allowCancel,
-        Action? cancelRequested)
+        Action? cancelRequested,
+        Action? savedRequested = null)
     {
         ArgumentNullException.ThrowIfNull(workspace);
         _workspace = workspace;
+        _savedRequested = savedRequested;
         _hostControls = hostControls;
         _palette = palette;
         _lockedPaperId = string.IsNullOrWhiteSpace(paperId) ? null : paperId;
@@ -767,7 +770,16 @@ internal sealed class BulkImportPanel : UserControl
         finally
         {
             _busy = false;
-            RecomputePreview();
+            if (failures.Count == 0 && _savedRequested != null)
+            {
+                // The popup closes itself once the paper is consistent; a partial failure keeps the
+                // editor open so the errors stay visible.
+                _savedRequested.Invoke();
+            }
+            else
+            {
+                RecomputePreview();
+            }
         }
     }
 

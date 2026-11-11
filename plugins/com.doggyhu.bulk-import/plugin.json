@@ -3,7 +3,7 @@
   "id": "com.doggyhu.bulk-import",
   "name": "批量编辑",
   "description": "把整张待办纸的任务当成一段文本编辑：一行一条，改完整体写回（新增 / 改名 / 删除 / 调序）。",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "apiVersion": "2.0",
   "stateVersion": 1,
   "entry": "PaperTodo.Plugin.BulkImport.dll",
@@ -50,3 +50,4 @@
     }
   ]
 }
+

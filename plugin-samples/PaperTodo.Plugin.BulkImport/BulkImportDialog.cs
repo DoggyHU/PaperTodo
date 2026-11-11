@@ -43,7 +43,8 @@ internal sealed class BulkImportDialog : Window
             paperId,
             paperTitle,
             allowCancel: true,
-            cancelRequested: Close);
+            cancelRequested: Close,
+            savedRequested: Close);
         _panel.ApplyDefaults(defaults);
         _panel.LoadBaseline();
 
@@ -252,4 +253,5 @@ internal sealed class BulkImportDialog : Window
         return grip;
     }
 }
+
 
